@@ -131,6 +131,6 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
-**Full Changelog:** https://github.com/APTlantis/Mirror-Crates/commits/v1.0.0
+**Full Changelog:** https://github.com/APTlantis/CloneCratesio/commits/v1.0.0
 
-**Download:** https://github.com/APTlantis/Mirror-Crates/releases/tag/v1.0.0
+**Download:** https://github.com/APTlantis/CloneCratesio/releases/tag/v1.0.0
