@@ -6,7 +6,7 @@
   <img alt="Go" src="https://img.shields.io/badge/Go-%3E%3D1.25-00ADD8?logo=go">
   <img alt="Python" src="https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python">
   <img alt="Go Report Card" src="https://goreportcard.com/badge/github.com/APTlantis/CloneCratesio">
-  <a href="https://github.com/APTlantis/Mirror-Crates/releases">
+  <a href="https://github.com/APTlantis/CloneCratesio/releases">
     <img alt="Release" src="https://img.shields.io/github/v/release/APTlantis/CloneCratesio?include_prereleases">
   </a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
