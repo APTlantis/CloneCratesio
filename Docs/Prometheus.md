@@ -7,7 +7,7 @@ Mirror-Crates exposes Prometheus metrics and pprof endpoints for real-time obser
 Start the downloader with the `-listen` flag to expose metrics on a specific port:
 
 ```powershell
-.\bin\download-crates.exe -index-dir "S:\Rust-Crates\crates.io-index" -out "S:\Rust-Crates\crates.io" -listen :9090
+.\main.exe -index-dir "M:\rust-lang\crates\crates.io-index" -out "M:\rust-lang\crates\crates.io" -listen :9090
 ```
 
 ## Available Endpoints
