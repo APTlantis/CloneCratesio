@@ -1,0 +1,45 @@
+[project]
+id = "cratesio-mirror"
+title = "Cratesio"
+description = "High-Performance Rust Crates.io Mirror and Metadata Sidecar Generator"
+type = "tool"
+stage = "production"
+version = "1.0.0"
+tags = ["rust", "mirror", "crates.io", "go", "python", "performance"]
+
+[metadata]
+created = "2026-01-01"
+last_updated = "2026-03-09"
+maintainer = "Aptlantis"
+license = "MIT"
+language_primary = "Go"
+languages_used = ["Go", "Python"]
+
+[runtime]
+platform = "cli"
+environment = "Go 1.25+, Python 3.9+"
+services = []
+storage = []
+
+[relationships]
+depends_on_projects = []
+used_by_projects = ["dir-mapper", "dataset-gen"]
+external_dependencies = ["Git"]
+
+[artifacts]
+produces = ["crates.io mirror archive", "JSONL sidecar metadata files", "tar.zst bundles"]
+consumes = ["crates.io-index"]
+
+[documentation]
+writerside_topic = "cratesio.md"
+readme = "README.md"
+
+[structure]
+repo_path = "A:\\AptWeb\\zypper-operations\\Cratesio"
+
+[automation]
+build = "go build ./cmd/..."
+tasks = ["go test ./...", "python Clone-Index.py"]
+
+[notes]
+metrics = "Includes Prometheus metrics and pprof endpoints."

@@ -1,3 +1,16 @@
+---
+[project]
+name = "Cratesio"
+slug = "cratesio"
+
+description = "High-Performance Rust Crates.io Mirror and Metadata Sidecar Generator"
+
+[tags]
+languages = ["go", "python", "rust"]
+platforms = ["windows", "linux"]
+tooling = ["git"]
+---
+
 # Mirror-Crates
 
 ### High-Performance Rust Crates.io Mirror and Metadata Sidecar Generator
