@@ -2,12 +2,16 @@
 
 Mirror-Crates exposes Prometheus metrics and pprof endpoints for real-time observability during large-scale mirroring operations.
 
-## Enabling Metrics
+## Default Behavior
 
-Start the downloader with the `-listen` flag to expose metrics on a specific port:
+The downloader starts the metrics and pprof listener on `:9090` by default.
+
+Use `-listen :PORT` to move it to a different address, or pass an empty string to disable it:
 
 ```powershell
-.\main.exe -index-dir "M:\rust-lang\crates\crates.io-index" -out "M:\rust-lang\crates\crates.io" -listen :9090
+.\main.exe -index-dir "M:\rust-lang\crates\crates.io-index" -out "M:\rust-lang\crates\crates.io"
+.\main.exe -index-dir "M:\rust-lang\crates\crates.io-index" -out "M:\rust-lang\crates\crates.io" -listen :9100
+.\main.exe -index-dir "M:\rust-lang\crates\crates.io-index" -out "M:\rust-lang\crates\crates.io" -listen ""
 ```
 
 ## Available Endpoints
@@ -114,15 +118,18 @@ Tracks processed records by result type.
 
 | Label | Values | Description |
 |-------|--------|-------------|
-| `result` | `ok`, `error`, `skipped` | Processing outcome |
+| `result` | `downloaded`, `existing`, `verified_existing`, `error` | Processing outcome |
 
 **Example queries:**
 ```promql
 # Completed downloads (new files)
-crates_processed_total{result="ok"}
+crates_processed_total{result="downloaded"}
 
-# Skipped (already exists with valid checksum)
-crates_processed_total{result="skipped"}
+# Existing files trusted during routine update runs
+crates_processed_total{result="existing"}
+
+# Existing files explicitly re-verified
+crates_processed_total{result="verified_existing"}
 
 # Error rate
 rate(crates_processed_total{result="error"}[5m])
@@ -138,6 +145,9 @@ The `/api/status` endpoint returns a JSON object for quick status checks:
   "processed": 1500000,
   "ok": 1499850,
   "errors": 150,
+  "downloaded": 12500,
+  "existing": 1487000,
+  "verified_existing": 350,
   "uptime_sec": 3600,
   "rate_per_sec": "416.7"
 }
@@ -151,6 +161,9 @@ The `/api/status` endpoint returns a JSON object for quick status checks:
 | `processed` | int | Total records processed |
 | `ok` | int | Successful downloads |
 | `errors` | int | Failed downloads |
+| `downloaded` | int | Newly downloaded files |
+| `existing` | int | Existing files trusted without re-verification |
+| `verified_existing` | int | Existing files re-hashed and verified |
 | `uptime_sec` | int | Seconds since process start |
 | `rate_per_sec` | string | Current processing rate |
 
@@ -187,7 +200,7 @@ rate(crates_download_bytes_total[1m]) / 1024 / 1024
 
 ### Progress Panel
 ```promql
-crates_processed_total{result="ok"} + crates_processed_total{result="skipped"}
+crates_processed_total{result="downloaded"} + crates_processed_total{result="existing"} + crates_processed_total{result="verified_existing"}
 ```
 *Shows total completed items*
 

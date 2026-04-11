@@ -17,6 +17,9 @@ func main() {
 	var (
 		indexDir         = flag.String("index-dir", "", "Path to local crates.io-index directory (e.g., C:\\Rust-Crates\\crates.io-index)")
 		outDir           = flag.String("out", "out", "Directory to write sidecar metadata files")
+		outputMode       = flag.String("output-mode", sidecar.OutputModeFiles, "Sidecar output mode: files|jsonl")
+		jsonlOut         = flag.String("jsonl-out", "", "Path to aggregated JSONL sidecar output (required for -output-mode jsonl)")
+		manifestPath     = flag.String("manifest", "", "Optional downloader manifest to enrich sidecars with bundle metadata")
 		includeY         = flag.Bool("include-yanked", false, "Include yanked versions from the index")
 		limitFlag        = flag.Int64("limit", 0, "Limit number of entries to write (0 = all)")
 		conc             = flag.Int("concurrency", defaultConcurrency, "Number of concurrent index-file workers")
@@ -64,6 +67,9 @@ func main() {
 		BaseURL:          *baseURL,
 		ProgressInterval: *progressInterval,
 		ProgressEvery:    *progressEvery,
+		OutputMode:       *outputMode,
+		JSONLOut:         *jsonlOut,
+		ManifestPath:     *manifestPath,
 	}
 
 	ctx := context.Background()

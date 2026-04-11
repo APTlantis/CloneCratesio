@@ -13,22 +13,18 @@ tooling = ["git"]
 
 # Mirror-Crates
 
-### High-Performance Rust Crates.io Mirror and Metadata Sidecar Generator
+### High-Performance Rust Crates.io Mirror, Bundle, and Sidecar Pipeline
 
 <p align="center">
   <img alt="Go" src="https://img.shields.io/badge/Go-%3E%3D1.25-00ADD8?logo=go">
   <img alt="Python" src="https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python">
   <img alt="Go Report Card" src="https://goreportcard.com/badge/github.com/APTlantis/CloneCratesio">
-  <a href="https://github.com/APTlantis/CloneCratesio/releases">
-    <img alt="Release" src="https://img.shields.io/github/v/release/APTlantis/CloneCratesio?include_prereleases">
-  </a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
-  <img alt="PRs Welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg">
   <img alt="Status" src="https://img.shields.io/badge/status-active-success">
 </p>
 
 <p align="center">
-  <strong>Mirror millions of Rust crates with high throughput, full integrity verification, and operational visibility.</strong>
+  <strong>Mirror crates.io as loose files or low-inode rolling bundles, then generate sidecars that match the storage mode you chose.</strong>
 </p>
 
 ---
@@ -37,227 +33,177 @@ tooling = ["git"]
 
 **Quick links:** [Quickstart (Windows)](Docs/Quickstart-Windows.md) | [Airgap Guide](Docs/Airgap-Guide.md) | [Architecture](Docs/Architecture.md) | [Prometheus Metrics](Docs/Prometheus.md)
 
-## Table of Contents
-
-- [Why It Is Fast](#why-it-is-fast)
-- [Features](#features)
-- [Repository Layout](#repository-layout)
-- [Getting Started](#getting-started)
-  - [Prerequisites](#prerequisites)
-  - [Build](#build)
-  - [Wrapper Script](#wrapper-script)
-  - [Downloader Usage](#downloader-usage)
-  - [Prometheus and pprof](#prometheus-and-pprof)
-  - [Sidecar Metadata Generator](#sidecar-metadata-generator)
-- [Screenshots](#screenshots)
-- [Development](#development)
-- [Windows and WSL Notes](#windows-and-wsl-notes)
-- [Roadmap Highlights](#roadmap-highlights)
-- [Contributing](#contributing)
-- [License](#license)
-
 ## Why It Is Fast
 
 Traditional mirroring scripts struggle with millions of tiny `.crate` files. This project focuses on:
 
-- **Massive concurrency** with HTTP/2 connection reuse
-- **Incremental resume** via checksum-aware download verification
-- **Optional bundling** into rolling `tar.zst` archives to reduce inode churn
-- **Structured JSONL manifests** for auditing and restart safety
-- **Prometheus metrics and pprof endpoints** for visibility under load
+- **High concurrency** with HTTP/2 connection reuse
+- **Fast incremental updates** by trusting existing crate files during routine syncs
+- **Explicit re-verification** with `-verify-existing` when you want a full checksum pass
+- **Rolling bundles** for low-inode workflows
+- **Structured JSONL audit logs** for run history, bundle metadata, and sidecar export
+- **Prometheus metrics and pprof** for live operational visibility
 
-These design choices prioritize correctness and completion under real-world load, not synthetic benchmarks.
+## What It Can Do
 
-> "The pipeline completed a full crates.io mirror (~1.8M artifacts, ~350 GB) in ~6.5 hours with a 99.995% success rate, including verification and metadata generation."
-
-## Features
-
-- **Download Crates** - High-throughput HTTP/2 downloader with exponential backoff retries and SHA-256 verification
-- **Generate Sidecars** - Per-crate JSON metadata files for offline tooling and registry compatibility
-- **Rolling Archives** - Optional `tar.zst` bundles to reduce filesystem overhead on large mirrors
-- **Prometheus Metrics** - Real-time observability with 6 metrics covering requests, bytes, duration, retries, and inflight counts
-- **pprof Endpoints** - CPU and memory profiling for performance tuning
-- **Resumable Downloads** - JSONL manifest tracks progress for safe restart after interruption
-- **Airgap Ready** - Full documentation for offline deployment and verification
+- **Download Crates** as a normal crates.io-style shard tree
+- **Bundle Crates** into rolling `tar.zst` archives with per-bundle manifests and a top-level bundle index
+- **Generate Loose Sidecars** as `name-version.crate.json` files next to loose crates
+- **Generate JSONL Sidecars** for bundled workflows without creating millions of tiny metadata files
+- **Extract Bundles** back into the normal crates.io shard layout
+- **Expose Metrics** automatically on `:9090` by default
 
 ## Repository Layout
 
-```
-Clone-Index.py               Python wrapper: fetch crates.io-index and invoke Go CLIs
+```text
+Clone-Index.py               Python wrapper: clone/update index and launch downloader
 cmd/
-  download-crates/           CLI: high-performance crate downloader
-  generate-sidecars/         CLI: generate per-crate metadata sidecars
+  download-crates/           CLI: mirror crates as loose files or bundles
+  extract-bundles/           CLI: restore bundle archives into shard layout
+  generate-sidecars/         CLI: write sidecars as files or JSONL
 internal/
-  downloader/                Download, retry, sharding, and optional bundling engine
-  sidecar/                   Sidecar generation library reused by the CLI
+  downloader/                Download, retry, bundle, manifest, and metrics engine
+  sidecar/                   Sidecar generation library
 Docs/                        Architecture, guides, and screenshots
 Testdata/                    Synthetic fixtures used in unit tests
 ```
 
-## Documentation Map
+## Build
 
-This repository includes multiple forms of documentation, each serving a distinct purpose:
-
-- **README.md**  
-  Quick orientation, build/run instructions, and repository layout.
-
-- **Architecture.md**  
-  System-level design, component responsibilities, and data flow.
-
-- **Technical Overview**  
-  Deep-dive into performance, concurrency, integrity, and failure modes.
-
-- **Engineering Integrity / Architectural Philosophy**  
-  Explains the values behind the design: supply-chain safety, determinism,
-  and systems-level thinking.
-
-- **Technical Q&A and Implementation Guide**  
-  Practical explanations of design decisions, edge cases, and real-world usage.
-
-- **Quickstart (Windows)**  
-  Step-by-step guide for running a full mirror on Windows.
-
-- **Airgap Guide**  
-  Procedures for packaging, transporting, and verifying mirrors offline.
-
-Screenshots and real run artifacts are included to demonstrate operational
-correctness under load.
-
-## Getting Started
-
-### Prerequisites
-- Go 1.25 or newer
-- Python 3.9 or newer
-- Git (for cloning the crates.io index)
-
-See also: Docs/Quickstart-Windows.md and Docs/Airgap-Guide.md.
-
-### Build
-
-Build all CLIs (recommended):
+Build all CLIs:
 
 ```sh
 go build ./cmd/...
 ```
 
-Or build individually:
+Or build individual binaries:
 
 ```powershell
 go build -o bin\download-crates.exe .\cmd\download-crates
 go build -o bin\generate-sidecars.exe .\cmd\generate-sidecars
+go build -o bin\extract-bundles.exe .\cmd\extract-bundles
 ```
 
-Run without building:
+## Recommended Workflows
 
-```sh
-go run ./cmd/download-crates -index-dir path/to/crates.io-index -out mirror-output
-```
+### 1. First Full Mirror as Loose Files
 
-#### Wrapper Script
-
-The Python wrapper defaults to user profile friendly paths:
-
-```bash
-python Clone-Index.py --index-dir "S:\\Rust-Crates\\crates.io-index" --output-dir "S:\\Rust-Crates\\crates.io" --threads 256 --non-interactive
-```
-
-It will clone or update the official `crates.io-index`, build or locate the downloader, and launch it with the provided thread count. All paths can be overridden via flags. Logging goes to `crate-download.log` inside the same root by default.
-
-### Downloader Usage
+Use this when you want a normal shard tree with `.crate` files on disk.
 
 ```powershell
-# With metrics on :9090
-.\bin\download-crates.exe -index-dir "S:\Rust-Crates\crates.io-index" -out "S:\Rust-Crates\crates.io" -concurrency 256 -include-yanked -progress-interval 5s -listen :9090
+python Clone-Index.py --index-dir "S:\Rust-Crates\crates.io-index" --output-dir "S:\Rust-Crates\crates.io" --threads 128 --non-interactive
 ```
+
+Or run the downloader directly:
+
+```powershell
+.\bin\download-crates.exe -index-dir "S:\Rust-Crates\crates.io-index" -out "S:\Rust-Crates\crates.io" -concurrency 128 -include-yanked -progress-interval 5s
+```
+
+Then generate loose sidecars:
+
+```powershell
+.\bin\generate-sidecars.exe -index-dir "S:\Rust-Crates\crates.io-index" -out "S:\Rust-Crates\crates.io" -output-mode files -concurrency 128 -include-yanked
+```
+
+### 2. Weekly Update Run
+
+The downloader now trusts existing crate files by default, so routine update runs do not re-hash the whole mirror.
+
+```powershell
+.\bin\download-crates.exe -index-dir "S:\Rust-Crates\crates.io-index" -out "S:\Rust-Crates\crates.io" -concurrency 128 -progress-interval 5s
+```
+
+If you want a full existing-file integrity sweep:
+
+```powershell
+.\bin\download-crates.exe -index-dir "S:\Rust-Crates\crates.io-index" -out "S:\Rust-Crates\crates.io" -verify-existing -concurrency 128
+```
+
+### 3. Low-Inode Bundle Workflow
+
+Use this when the main goal is reducing inode pressure and avoiding a second full loose-file copy.
+
+```powershell
+.\bin\download-crates.exe -index-dir "S:\Rust-Crates\crates.io-index" -out "S:\Rust-Crates\staging" -bundle -bundle-mode only -bundle-size-gb 8 -bundles-out "S:\Rust-Crates\bundles" -manifest "S:\Rust-Crates\manifest.jsonl" -concurrency 128
+```
+
+Important notes:
+
+- `-bundle-mode only` is the default and removes loose `.crate` files after they are written into the bundle
+- `-bundle-mode add` keeps both the loose files and the bundle
+- Each bundle now gets its own manifest JSONL
+- The bundles directory also gets a top-level `bundles.index.jsonl`
+
+Generate JSONL sidecars for the bundled mirror:
+
+```powershell
+.\bin\generate-sidecars.exe -index-dir "S:\Rust-Crates\crates.io-index" -output-mode jsonl -jsonl-out "S:\Rust-Crates\bundle-sidecars.jsonl" -manifest "S:\Rust-Crates\manifest.jsonl" -concurrency 128 -include-yanked
+```
+
+### 4. Restore a Bundle Set to Loose Files
+
+Bundle archives now preserve the normal shard layout inside the tar, so extraction recreates the expected directory tree directly.
+
+```powershell
+.\bin\extract-bundles.exe -bundles-dir "S:\Rust-Crates\bundles" -out "S:\Rust-Crates\restored"
+```
+
+Use `-overwrite` if you want existing files replaced.
+
+## Downloader Notes
 
 Common options:
-- `-limit` - Download only the first N entries for testing.
-- `-bundle` / `-bundles-out` - Stream completed crates into rolling `tar.zst` archives.
-- `-checksums` - Provide an external checksum JSONL file to enforce integrity.
-- `-retries`, `-retry-base`, `-retry-max` - Configure retry policy.
-- `-log-format`, `-log-level` - Structured logging (text or JSON).
 
-### Prometheus and pprof
+- `-concurrency` - Number of concurrent downloads. Default: `128`
+- `-verify-existing` - Re-hash and verify existing crate files instead of trusting them during update runs
+- `-bundle` - Enable rolling `tar.zst` bundling
+- `-bundle-mode only|add` - Choose whether bundled runs remove or keep loose crate files
+- `-bundle-size-gb` - Target bundle size in GB. Default: `8`
+- `-bundles-out` - Directory for `.tar.zst` bundles, per-bundle manifests, and `bundles.index.jsonl`
+- `-manifest` - Write the JSONL audit log for the run
+- `-listen :PORT` - Override the default metrics listener (`:9090`); pass an empty string to disable it
+- startup logs now print the effective run configuration before work begins
+- completion logs now print a cleaner end-of-run summary with processed, downloaded, existing, verified, elapsed, and rate
 
-Expose metrics and runtime profiling by supplying `-listen :PORT`:
+## Sidecar Notes
+
+Sidecars now intentionally follow the storage mode:
+
+- `-output-mode files` is for loose-file mirrors and writes `name-version.crate.json`
+- `-output-mode jsonl` is for bundle workflows and writes one aggregated JSONL stream
+- `-manifest` can enrich JSONL sidecars with `storage`, `bundle_path`, and `bundle_member`
+
+## Prometheus and pprof
+
+The downloader starts metrics and runtime profiling on `:9090` by default. Override it with `-listen :PORT` if you want a different address, or pass an empty string to disable it:
+
 - Metrics: `http://localhost:PORT/metrics`
+- JSON status: `http://localhost:PORT/api/status`
 - pprof: `http://localhost:PORT/debug/pprof/`
 
-### Sidecar Metadata Generator
-
-```powershell
-# If you built into .\bin as above
-.\bin\generate-sidecars.exe -index-dir "S:\Rust-Crates\crates.io-index" -out "S:\Rust-Crates\crates.io" -concurrency 256 -include-yanked -progress-interval 5s -log-format text -log-level info
-```
-
-Sidecars (`crate-name-version.crate.json`) are written alongside the crate files using the same sharding scheme. A concurrency-safe global limit ensures predictable output when using `-limit`.
-
-![Sidecar generator in action](Docs/SidecarsInAction-Screenshot%202026-01-14%20174545.png)
-
-## Screenshots
-
-<details>
-<summary>Click to expand screenshots</summary>
-
-### Project Structure
-
-![Project structure overview](Docs/ProjectStructure-Screenshot%202026-01-14%20175353.png)
-
-### Starting the Clone Process
-
-![Clone-Index starting](Docs/CloneCrates-Screenshot%202026-01-14%20161843.png)
-
-### Sidecar Generator Output
-
-![Sidecar generator](Docs/SideCarGenerator-Screenshot%202026-01-14%20174049.png)
-
-### Generating Sidecars (No Errors)
-
-![Generating sidecars successfully](Docs/GeneratingSidecars-NoErrors-Screenshot%202026-01-14%20175852.png)
-
-### Bundles and Manifest Output
-
-![Bundles and manifest](Docs/BundlesAndManifest-Screenshot%202026-01-28%20080216.png)
-
-</details>
+See [Docs/Prometheus.md](Docs/Prometheus.md) for metric details.
 
 ## Development
 
-- Format: `gofmt -w .` (exclude vendored toolchain: `git ls-files -z | rg -z -v "^\.tools/" | %{ $_ } | ForEach-Object { $_ }`)
-- Tests: `go test ./...` (unit tests live under `internal/`)
+- Format: `gofmt -w .`
+- Tests: `go test ./...`
 - Lint suggestions: `go vet ./...`, `staticcheck ./...`, `golangci-lint run ./...`
 
-### Windows and WSL Notes
+## Windows and WSL Notes
 
-- PowerShell examples use `bin\*.exe`; on WSL/Linux use `bin/*`.
-- The repo includes a local Go toolchain under `.tools/go` for reproducible builds. If preferred, use your system Go 1.25+.
-- Large runs benefit from fast disks (NVMe) and NTFS compression disabled on the destination directory.
+- PowerShell examples use `bin\*.exe`; on WSL/Linux use `bin/*`
+- The repo includes a local Go toolchain under `.tools/go`
+- Large runs benefit from fast disks and predictable destination paths
 
 ## Roadmap Highlights
 
 - [ ] GUI front-end for monitoring progress, pre-flight checks, and bundle verification
 - [ ] Grafana dashboard templates for Prometheus metrics visualization
-- [ ] Sample manifests and disk usage estimators for planning offline mirrors
+- [ ] Sample manifest and bundle-inspection utilities
 - [ ] Delta sync tooling for periodic updates
-
-## Contributing
-
-Contributions are welcome. Please:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-For bug reports and feature requests, please [open an issue](https://github.com/APTlantis/Mirror-Crates/issues).
 
 ## License
 
 MIT License. See [LICENSE](LICENSE).
-
----
-
-<p align="center">
-  Made with care for the Rust community.
-</p>
+The Python wrapper now also forwards the day-to-day downloader flags that matter most, including `--include-yanked`, `--verify-existing`, `--bundle`, `--bundle-mode`, `--bundle-size-gb`, `--bundles-out`, `--manifest`, `--listen`, `--progress-interval`, and `--dry-run`.

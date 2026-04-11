@@ -49,7 +49,10 @@ temp/
 ehthumbs.db
 Desktop.ini
 AGENTS.md
-
+/.idea/
 /.claude/
 /help.txt
 /go.sum
+/Archive-Hasher/go.sum
+/Docs/Maintainer-Retrospective-v1.1.0.md
+/RELEASE-v1.1.0.md

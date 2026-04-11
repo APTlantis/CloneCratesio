@@ -3,7 +3,7 @@
 // 1) Concurrently download millions of small files (e.g., crates) using HTTP/2
 // 2) Verify optional SHA256 checksums (if provided)
 // 3) Optionally stream files into rolling .tar.zst bundles (5–10GB) while downloading
-// 4) Maintain a manifest for resume/verify
+// 4) Maintain a manifest audit log for verification and run history
 //
 // Usage (examples):
 //   go mod init mirror-crates-fast && go get github.com/klauspost/compress/zstd@v1.20.0
@@ -51,7 +51,6 @@ import (
 	"net/http/pprof"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -62,11 +61,21 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+const defaultConcurrency = 128
+
+const (
+	BundleModeOnly = "only"
+	BundleModeAdd  = "add"
+)
+
 // Record describes one downloaded object for the manifest.
 type Record struct {
 	SchemaVersion int    `json:"schema_version"`
 	URL           string `json:"url"`
 	Path          string `json:"path"`
+	Storage       string `json:"storage,omitempty"`
+	BundlePath    string `json:"bundle_path,omitempty"`
+	BundleMember  string `json:"bundle_member,omitempty"`
 	Size          int64  `json:"size"`
 	SHA256        string `json:"sha256"`
 	StartedAt     string `json:"started_at"`
@@ -115,13 +124,21 @@ type Bundler struct {
 	enabled     bool
 	outDir      string
 	targetBytes int64
+	catalogPath string
 
-	mu           sync.Mutex
-	currentIdx   int
-	currentBytes int64
-	tw           *tar.Writer
-	zw           *zstd.Encoder
-	outFile      *os.File
+	mu                 sync.Mutex
+	currentIdx         int
+	currentBytes       int64
+	currentPath        string
+	currentManifest    string
+	currentMinCrate    string
+	currentMaxCrate    string
+	currentEntryCount  int
+	tw                 *tar.Writer
+	zw                 *zstd.Encoder
+	outFile            *os.File
+	manifestFile       *os.File
+	manifestJSONWriter *json.Encoder
 }
 
 func NewBundler(enabled bool, bundlesOut string, targetGB int64) (*Bundler, error) {
@@ -131,7 +148,12 @@ func NewBundler(enabled bool, bundlesOut string, targetGB int64) (*Bundler, erro
 	if err := os.MkdirAll(bundlesOut, 0o755); err != nil {
 		return nil, err
 	}
-	b := &Bundler{enabled: true, outDir: bundlesOut, targetBytes: targetGB * (1 << 30)}
+	b := &Bundler{
+		enabled:     true,
+		outDir:      bundlesOut,
+		targetBytes: targetGB * (1 << 30),
+		catalogPath: filepath.Join(bundlesOut, "bundles.index.jsonl"),
+	}
 	if err := b.rotateLocked(); err != nil {
 		return nil, err
 	}
@@ -142,19 +164,12 @@ func (b *Bundler) rotateLocked() error {
 	if !b.enabled {
 		return nil
 	}
-	// Close existing
-	if b.tw != nil {
-		b.tw.Close()
-	}
-	if b.zw != nil {
-		b.zw.Close()
-	}
-	if b.outFile != nil {
-		b.outFile.Close()
+	if err := b.finalizeLocked(); err != nil {
+		return err
 	}
 
-	name := fmt.Sprintf("bundle-%04d.tar.zst", b.currentIdx)
-	path := filepath.Join(b.outDir, name)
+	baseName := fmt.Sprintf("bundle-%04d", b.currentIdx)
+	path := filepath.Join(b.outDir, baseName+".tar.zst")
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -165,35 +180,50 @@ func (b *Bundler) rotateLocked() error {
 		return err
 	}
 	tw := tar.NewWriter(zw)
+	manifestPath := filepath.Join(b.outDir, baseName+".manifest.jsonl")
+	mf, err := os.Create(manifestPath)
+	if err != nil {
+		tw.Close()
+		zw.Close()
+		f.Close()
+		return err
+	}
 
 	b.outFile = f
 	b.zw = zw
 	b.tw = tw
+	b.currentPath = path
+	b.currentManifest = manifestPath
+	b.manifestFile = mf
+	b.manifestJSONWriter = json.NewEncoder(mf)
+	b.currentMinCrate = ""
+	b.currentMaxCrate = ""
+	b.currentEntryCount = 0
 	b.currentBytes = 0
 	b.currentIdx++
 	return nil
 }
 
-func (b *Bundler) AddFile(filePath string, headerName string) error {
+func (b *Bundler) AddFile(filePath string, headerName string, rec Record, crateName string) (string, error) {
 	if !b.enabled {
-		return nil
+		return "", nil
 	}
 	fi, err := os.Stat(filePath)
 	if err != nil {
-		return err
+		return "", err
 	}
 	// Rotate if needed (estimate using uncompressed size as proxy)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.currentBytes+fi.Size() > b.targetBytes {
 		if err := b.rotateLocked(); err != nil {
-			return err
+			return "", err
 		}
 	}
 	// Open file and add to tar
 	f, err := os.Open(filePath)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer f.Close()
 
@@ -206,14 +236,17 @@ func (b *Bundler) AddFile(filePath string, headerName string) error {
 		Gid:     0,
 	}
 	if err := b.tw.WriteHeader(hdr); err != nil {
-		return err
+		return "", err
 	}
 	n, err := io.Copy(b.tw, f)
 	if err != nil {
-		return err
+		return "", err
 	}
 	b.currentBytes += n
-	return nil
+	if err := b.writeManifestEntryLocked(headerName, rec, crateName); err != nil {
+		return "", err
+	}
+	return b.currentPath, nil
 }
 
 func (b *Bundler) Close() error {
@@ -222,39 +255,150 @@ func (b *Bundler) Close() error {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.finalizeLocked()
+}
+
+func (b *Bundler) finalizeLocked() error {
 	if b.tw != nil {
 		if err := b.tw.Close(); err != nil {
 			return err
 		}
+		b.tw = nil
 	}
 	if b.zw != nil {
 		if err := b.zw.Close(); err != nil {
 			return err
 		}
+		b.zw = nil
 	}
 	if b.outFile != nil {
-		return b.outFile.Close()
+		if err := b.outFile.Close(); err != nil {
+			return err
+		}
+		b.outFile = nil
 	}
+	if b.manifestFile != nil {
+		if err := b.manifestFile.Close(); err != nil {
+			return err
+		}
+		b.manifestFile = nil
+		b.manifestJSONWriter = nil
+	}
+	if b.currentPath == "" {
+		return nil
+	}
+	if b.currentEntryCount == 0 {
+		_ = os.Remove(b.currentPath)
+		if b.currentManifest != "" {
+			_ = os.Remove(b.currentManifest)
+		}
+		b.currentPath = ""
+		b.currentManifest = ""
+		return nil
+	}
+
+	finalBase := fmt.Sprintf("bundle-%04d-%s-to-%s", b.currentIdx-1, bundleLabel(b.currentMinCrate), bundleLabel(b.currentMaxCrate))
+	finalManifestPath := filepath.Join(b.outDir, finalBase+".manifest.jsonl")
+
+	if b.currentManifest != "" && b.currentManifest != finalManifestPath {
+		if err := os.Rename(b.currentManifest, finalManifestPath); err != nil {
+			return err
+		}
+	}
+	if err := b.appendCatalogEntryLocked(finalManifestPath); err != nil {
+		return err
+	}
+
+	b.currentPath = ""
+	b.currentManifest = ""
+	b.currentMinCrate = ""
+	b.currentMaxCrate = ""
+	b.currentEntryCount = 0
+	b.currentBytes = 0
 	return nil
+}
+
+func (b *Bundler) appendCatalogEntryLocked(finalManifestPath string) error {
+	if b.catalogPath == "" {
+		return nil
+	}
+	f, err := os.OpenFile(b.catalogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	entry := map[string]any{
+		"bundle_path":     b.currentPath,
+		"manifest_path":   finalManifestPath,
+		"crate_min":       b.currentMinCrate,
+		"crate_max":       b.currentMaxCrate,
+		"crate_min_label": bundleLabel(b.currentMinCrate),
+		"crate_max_label": bundleLabel(b.currentMaxCrate),
+		"entries":         b.currentEntryCount,
+		"size_bytes":      b.currentBytes,
+	}
+	return enc.Encode(entry)
+}
+
+func (b *Bundler) writeManifestEntryLocked(headerName string, rec Record, crateName string) error {
+	if b.manifestJSONWriter == nil {
+		return nil
+	}
+	if b.currentMinCrate == "" || crateName < b.currentMinCrate {
+		b.currentMinCrate = crateName
+	}
+	if b.currentMaxCrate == "" || crateName > b.currentMaxCrate {
+		b.currentMaxCrate = crateName
+	}
+	entry := map[string]any{
+		"url":           rec.URL,
+		"crate":         crateName,
+		"bundle_path":   b.currentPath,
+		"bundle_member": headerName,
+		"size":          rec.Size,
+		"sha256":        rec.SHA256,
+	}
+	if err := b.manifestJSONWriter.Encode(entry); err != nil {
+		return err
+	}
+	b.currentEntryCount++
+	return nil
+}
+
+func bundleLabel(crateName string) string {
+	label := strings.ToLower(strings.TrimSpace(crateName))
+	if label == "" {
+		return "unknown"
+	}
+	label = strings.ReplaceAll(label, ".", "-")
+	label = strings.ReplaceAll(label, "_", "-")
+	label = strings.ReplaceAll(label, " ", "-")
+	return label
 }
 
 // Downloader holds state for concurrent fetching.
 type Downloader struct {
-	client       *http.Client
-	outDir       string
-	checksums    map[string]string // url -> sha256 (hex)
-	concurrency  int
-	timeout      time.Duration
-	progressEach int64         // log progress every N files (0=disabled)
-	progressIntv time.Duration // periodic progress interval (0=disabled)
+	client         *http.Client
+	outDir         string
+	checksums      map[string]string // url -> sha256 (hex)
+	concurrency    int
+	timeout        time.Duration
+	progressEach   int64         // log progress every N files (0=disabled)
+	progressIntv   time.Duration // periodic progress interval (0=disabled)
+	verifyExisting bool
+	bundleMode     string
 
 	recordsW *SafeWriter
 	bundler  *Bundler
 
-	countsMu sync.Mutex
-	total    int64
-	okCount  int64
-	errCount int64
+	countsMu        sync.Mutex
+	total           int64
+	okCount         int64
+	errCount        int64
+	downloadedCount int64
+	existingCount   int64
+	verifiedCount   int64
 
 	// retry settings
 	retries   int
@@ -262,6 +406,17 @@ type Downloader struct {
 	retryMax  time.Duration
 
 	startedAt time.Time
+}
+
+type RunSummary struct {
+	Processed        int64
+	OK               int64
+	Errors           int64
+	Downloaded       int64
+	Existing         int64
+	VerifiedExisting int64
+	Elapsed          time.Duration
+	RatePerSec       float64
 }
 
 // Metrics
@@ -293,23 +448,28 @@ func serveMetrics(addr string) {
 	// Minimal JSON status endpoint for future GUI
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		type status struct {
-			Version   string `json:"version"`
-			Processed int64  `json:"processed"`
-			OK        int64  `json:"ok"`
-			Errors    int64  `json:"errors"`
-			UptimeSec int64  `json:"uptime_sec"`
-			Rate      string `json:"rate_per_sec"`
+			Version          string `json:"version"`
+			Processed        int64  `json:"processed"`
+			OK               int64  `json:"ok"`
+			Errors           int64  `json:"errors"`
+			Downloaded       int64  `json:"downloaded"`
+			Existing         int64  `json:"existing"`
+			VerifiedExisting int64  `json:"verified_existing"`
+			UptimeSec        int64  `json:"uptime_sec"`
+			Rate             string `json:"rate_per_sec"`
 		}
-		// Best-effort snapshot; rate derived from Prom is non-trivial here, so omit if unknown.
-		// We expose counts via theDownloaderSnapshot helper.
 		processed, ok, errc, startedAt, rate := theDownloaderSnapshot()
+		downloaded, existing, verified := theDownloaderDetailSnapshot()
 		st := status{
-			Version:   "dev",
-			Processed: processed,
-			OK:        ok,
-			Errors:    errc,
-			UptimeSec: int64(time.Since(startedAt).Seconds()),
-			Rate:      rate,
+			Version:          "dev",
+			Processed:        processed,
+			OK:               ok,
+			Errors:           errc,
+			Downloaded:       downloaded,
+			Existing:         existing,
+			VerifiedExisting: verified,
+			UptimeSec:        int64(time.Since(startedAt).Seconds()),
+			Rate:             rate,
 		}
 		b, _ := json.Marshal(st)
 		w.Header().Set("Content-Type", "application/json")
@@ -339,8 +499,9 @@ func StartMetricsServer(addr string) {
 
 // global snapshot hooks for status (set by NewDownloader)
 var (
-	snapMu   sync.RWMutex
-	snapFunc func() (processed, ok, errc int64, started time.Time, rate string)
+	snapMu       sync.RWMutex
+	snapFunc     func() (processed, ok, errc int64, started time.Time, rate string)
+	detailSnapFn func() (downloaded, existing, verified int64)
 )
 
 func theDownloaderSnapshot() (processed, ok, errc int64, started time.Time, rate string) {
@@ -349,6 +510,16 @@ func theDownloaderSnapshot() (processed, ok, errc int64, started time.Time, rate
 	snapMu.RUnlock()
 	if f == nil {
 		return 0, 0, 0, time.Now().Add(-time.Second), ""
+	}
+	return f()
+}
+
+func theDownloaderDetailSnapshot() (downloaded, existing, verified int64) {
+	snapMu.RLock()
+	f := detailSnapFn
+	snapMu.RUnlock()
+	if f == nil {
+		return 0, 0, 0
 	}
 	return f()
 }
@@ -366,6 +537,24 @@ func (d *Downloader) incErr() {
 	d.countsMu.Unlock()
 }
 
+func (d *Downloader) incDownloaded() {
+	d.countsMu.Lock()
+	d.downloadedCount++
+	d.countsMu.Unlock()
+}
+
+func (d *Downloader) incExisting() {
+	d.countsMu.Lock()
+	d.existingCount++
+	d.countsMu.Unlock()
+}
+
+func (d *Downloader) incVerified() {
+	d.countsMu.Lock()
+	d.verifiedCount++
+	d.countsMu.Unlock()
+}
+
 func (d *Downloader) incTotal() int64 {
 	d.countsMu.Lock()
 	d.total++
@@ -374,20 +563,43 @@ func (d *Downloader) incTotal() int64 {
 	return t
 }
 
-func (d *Downloader) snapshotCounts() (ok int64, err int64) {
+func (d *Downloader) snapshotCounts() (ok int64, err int64, downloaded int64, existing int64, verified int64) {
 	d.countsMu.Lock()
 	ok = d.okCount
 	err = d.errCount
+	downloaded = d.downloadedCount
+	existing = d.existingCount
+	verified = d.verifiedCount
 	d.countsMu.Unlock()
 	return
 }
 
-// DefaultConcurrency returns an aggressive yet safe default for high-throughput mirroring.
-func DefaultConcurrency() int {
-	return max(64, runtime.NumCPU()*32)
+func (d *Downloader) Snapshot() RunSummary {
+	ok, errc, downloaded, existing, verified := d.snapshotCounts()
+	processed := d.getTotal()
+	elapsed := time.Since(d.startedAt)
+	var rate float64
+	if elapsed > 0 {
+		rate = float64(processed) / elapsed.Seconds()
+	}
+	return RunSummary{
+		Processed:        processed,
+		OK:               ok,
+		Errors:           errc,
+		Downloaded:       downloaded,
+		Existing:         existing,
+		VerifiedExisting: verified,
+		Elapsed:          elapsed,
+		RatePerSec:       rate,
+	}
 }
 
-func NewDownloader(outDir string, concurrency int, timeout time.Duration, checksums map[string]string, recordsW io.Writer, bundler *Bundler) *Downloader {
+// DefaultConcurrency returns the documented out-of-the-box concurrency used by the CLI and wrapper.
+func DefaultConcurrency() int {
+	return defaultConcurrency
+}
+
+func NewDownloader(outDir string, concurrency int, timeout time.Duration, checksums map[string]string, recordsW io.Writer, bundler *Bundler, verifyExisting bool, bundleMode string) *Downloader {
 	// HTTP client tuned for many concurrent requests
 	tr := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -403,19 +615,21 @@ func NewDownloader(outDir string, concurrency int, timeout time.Duration, checks
 	cli := &http.Client{Transport: tr, Timeout: timeout}
 
 	d := &Downloader{
-		client:       cli,
-		outDir:       outDir,
-		checksums:    checksums,
-		concurrency:  concurrency,
-		timeout:      timeout,
-		progressEach: 0,
-		progressIntv: 0,
-		recordsW:     &SafeWriter{w: recordsW},
-		bundler:      bundler,
-		retries:      6,
-		retryBase:    500 * time.Millisecond,
-		retryMax:     30 * time.Second,
-		startedAt:    time.Now(),
+		client:         cli,
+		outDir:         outDir,
+		checksums:      checksums,
+		concurrency:    concurrency,
+		timeout:        timeout,
+		progressEach:   0,
+		progressIntv:   0,
+		verifyExisting: verifyExisting,
+		bundleMode:     bundleMode,
+		recordsW:       &SafeWriter{w: recordsW},
+		bundler:        bundler,
+		retries:        6,
+		retryBase:      500 * time.Millisecond,
+		retryMax:       30 * time.Second,
+		startedAt:      time.Now(),
 	}
 	snapMu.Lock()
 	snapFunc = func() (int64, int64, int64, time.Time, string) {
@@ -430,6 +644,14 @@ func NewDownloader(outDir string, concurrency int, timeout time.Duration, checks
 			rate = fmt.Sprintf("%.1f", float64(total)/elapsed)
 		}
 		return total, okc, errc, d.startedAt, rate
+	}
+	detailSnapFn = func() (int64, int64, int64) {
+		d.countsMu.Lock()
+		downloaded := d.downloadedCount
+		existing := d.existingCount
+		verified := d.verifiedCount
+		d.countsMu.Unlock()
+		return downloaded, existing, verified
 	}
 	snapMu.Unlock()
 	return d
@@ -513,17 +735,35 @@ func (d *Downloader) fetchOne(ctx context.Context, url string, filesCh chan<- st
 	}
 	outPath := filepath.Join(crateDir, name)
 
-	// Skip if exists and checksum (if any) matches
-	if _, err := os.Stat(outPath); err == nil {
-		if ok, _ := d.verifyFile(outPath, url); ok {
-			rec.Path = outPath
-			rec.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+	// Existing files are trusted by default for incremental update runs.
+	// Operators can opt into a full checksum pass with verifyExisting.
+	if fi, err := os.Stat(outPath); err == nil {
+		rec.Path = outPath
+		rec.Size = fi.Size()
+		rec.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+		if !d.verifyExisting {
 			rec.OK = true
-			rec.Status = "ok"
+			rec.Status = "existing"
+			rec.Storage = "filesystem"
 			d.incOK()
-			metProcessed.WithLabelValues("skipped").Inc()
+			d.incExisting()
+			metProcessed.WithLabelValues("existing").Inc()
 			return rec
 		}
+
+		ok, sum := d.verifyFile(outPath, url)
+		rec.SHA256 = sum
+		if ok {
+			rec.OK = true
+			rec.Status = "verified_existing"
+			rec.Storage = "filesystem"
+			d.incOK()
+			d.incVerified()
+			metProcessed.WithLabelValues("verified_existing").Inc()
+			return rec
+		}
+
+		slog.Warn("existing file failed verification; redownloading", "url", url, "path", outPath)
 	}
 
 	// Create file tmp then rename with retries for transient failures
@@ -640,18 +880,33 @@ func (d *Downloader) fetchOne(ctx context.Context, url string, filesCh chan<- st
 		// keep the file for debugging; caller may decide to delete
 	} else {
 		d.incOK()
-		rec.Status = "ok"
-		metProcessed.WithLabelValues("ok").Inc()
+		d.incDownloaded()
+		rec.Status = "downloaded"
+		rec.Storage = "filesystem"
+		metProcessed.WithLabelValues("downloaded").Inc()
 		// Send to bundler
 		if d.bundler != nil && d.bundler.enabled {
-			// header path inside tar mirrors subdir structure by url host/path
-			headerName := headerPathFor(url, name)
-			if err := d.bundler.AddFile(outPath, headerName); err != nil {
+			headerName := bundleMemberPath(d.outDir, outPath)
+			bundlePath, err := d.bundler.AddFile(outPath, headerName, rec, crate)
+			if err != nil {
 				// Log but keep going
 				slog.Warn("bundle_failed", "url", url, "err", err.Error())
+			} else {
+				rec.BundlePath = bundlePath
+				rec.BundleMember = headerName
+				if d.bundleMode == BundleModeOnly {
+					if err := os.Remove(outPath); err != nil {
+						slog.Warn("bundle_cleanup_failed", "path", outPath, "err", err.Error())
+					} else {
+						rec.Path = ""
+						rec.Storage = "bundle"
+					}
+				} else {
+					rec.Storage = "filesystem+bundle"
+				}
 			}
 		}
-		if filesCh != nil {
+		if filesCh != nil && rec.Path != "" {
 			filesCh <- outPath
 		}
 	}
@@ -659,26 +914,11 @@ func (d *Downloader) fetchOne(ctx context.Context, url string, filesCh chan<- st
 	return rec
 }
 
-func headerPathFor(url string, base string) string {
-	// simple: host + first-level path dirs; otherwise fallback to base
-	// We avoid importing net/url to keep this lean; heuristic split
-	host := ""
-	if strings.HasPrefix(url, "http") {
-		// http(s)://host/...
-		rest := url
-		if i := strings.Index(rest, "://"); i >= 0 {
-			rest = rest[i+3:]
-		}
-		if j := strings.Index(rest, "/"); j >= 0 {
-			host = rest[:j]
-		} else {
-			host = rest
-		}
+func bundleMemberPath(outDir, outPath string) string {
+	if rel, err := filepath.Rel(outDir, outPath); err == nil {
+		return filepath.ToSlash(rel)
 	}
-	if host == "" {
-		return base
-	}
-	return filepath.Join(host, base)
+	return filepath.Base(outPath)
 }
 
 func (d *Downloader) verifyFile(path, url string) (bool, string) {
@@ -739,7 +979,15 @@ func (d *Downloader) Run(ctx context.Context, urls []string) error {
 		return err
 	}
 
-	slog.Info("starting", "urls", len(urls), "concurrency", d.concurrency, "out", d.outDir)
+	slog.Info(
+		"download run starting",
+		"urls", len(urls),
+		"concurrency", d.concurrency,
+		"out", d.outDir,
+		"verify_existing", d.verifyExisting,
+		"bundle_enabled", d.bundler != nil && d.bundler.enabled,
+		"bundle_mode", d.bundleMode,
+	)
 	start := time.Now()
 
 	urlsCh := make(chan string)
@@ -771,8 +1019,8 @@ func (d *Downloader) Run(ctx context.Context, urls []string) error {
 			enc.Encode(rec)
 			processed = d.incTotal()
 			if d.progressEach > 0 && processed%d.progressEach == 0 {
-				ok, errc := d.snapshotCounts()
-				slog.Info("progress", "processed", processed, "ok", ok, "err", errc)
+				ok, errc, downloaded, existing, verified := d.snapshotCounts()
+				slog.Info("progress", "processed", processed, "ok", ok, "err", errc, "downloaded", downloaded, "existing", existing, "verified_existing", verified)
 			}
 		}
 	}()
@@ -792,13 +1040,13 @@ func (d *Downloader) Run(ctx context.Context, urls []string) error {
 					if processed == last {
 						continue
 					}
-					ok, errc := d.snapshotCounts()
+					ok, errc, downloaded, existing, verified := d.snapshotCounts()
 					elapsed := time.Since(start)
 					var rate float64
 					if elapsed > 0 {
 						rate = float64(processed) / elapsed.Seconds()
 					}
-					slog.Info("progress", "processed", processed, "ok", ok, "err", errc, "elapsed", elapsed.String(), "rate_per_sec", fmt.Sprintf("%.1f", rate))
+					slog.Info("progress", "processed", processed, "ok", ok, "err", errc, "downloaded", downloaded, "existing", existing, "verified_existing", verified, "elapsed", elapsed.String(), "rate_per_sec", fmt.Sprintf("%.1f", rate))
 					last = processed
 				case <-progressDone:
 					return
@@ -827,8 +1075,22 @@ func (d *Downloader) Run(ctx context.Context, urls []string) error {
 	}
 
 	dur := time.Since(start)
-	ok, errc := d.snapshotCounts()
-	slog.Info("done", "total", d.getTotal(), "ok", ok, "err", errc, "elapsed", dur.String())
+	ok, errc, downloaded, existing, verified := d.snapshotCounts()
+	var rate float64
+	if dur > 0 {
+		rate = float64(d.getTotal()) / dur.Seconds()
+	}
+	slog.Info(
+		"download run complete",
+		"processed", d.getTotal(),
+		"ok", ok,
+		"errors", errc,
+		"downloaded", downloaded,
+		"existing", existing,
+		"verified_existing", verified,
+		"elapsed", dur.String(),
+		"rate_per_sec", fmt.Sprintf("%.1f", rate),
+	)
 	return nil
 }
 

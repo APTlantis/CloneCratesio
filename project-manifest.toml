@@ -1,45 +1,44 @@
 [project]
-id = "cratesio-mirror"
+id = "Cratesio"
 title = "Cratesio"
-description = "High-Performance Rust Crates.io Mirror and Metadata Sidecar Generator"
-type = "tool"
+description = "High-performance Rust crates.io mirror with sidecar metadata generation and Prometheus observability"
+type = "infrastructure"
 stage = "production"
 version = "1.0.0"
-tags = ["rust", "mirror", "crates.io", "go", "python", "performance"]
+tags = ["operations", "infrastructure"]
 
 [metadata]
-created = "2026-01-01"
-last_updated = "2026-03-09"
+created = "2026-04-09"
+last_updated = "2026-04-09"
 maintainer = "Aptlantis"
 license = "MIT"
 language_primary = "Go"
-languages_used = ["Go", "Python"]
+languages_used = ["Go"]
 
 [runtime]
 platform = "cli"
-environment = "Go 1.25+, Python 3.9+"
+environment = ""
 services = []
 storage = []
 
 [relationships]
-depends_on_projects = []
-used_by_projects = ["dir-mapper", "dataset-gen"]
-external_dependencies = ["Git"]
+depends_on_projects = ["Go 1.25", "Python 3.9+", "Git"]
+used_by_projects = []
+external_dependencies = []
 
 [artifacts]
-produces = ["crates.io mirror archive", "JSONL sidecar metadata files", "tar.zst bundles"]
-consumes = ["crates.io-index"]
+produces = ["crates-mirror", "sidecar-json-per-crate", "tar-zst-bundles", "manifest-jsonl"]
+consumes = ["crates.io-index", "static.crates.io"]
 
 [documentation]
 writerside_topic = "cratesio.md"
 readme = "README.md"
 
 [structure]
-repo_path = "A:\\AptWeb\\zypper-operations\\Cratesio"
+repo_path = "D:\\AptWeb\\Cratesio"
 
 [automation]
-build = "go build ./cmd/..."
-tasks = ["go test ./...", "python Clone-Index.py"]
+build = ""
+tasks = []
 
 [notes]
-metrics = "Includes Prometheus metrics and pprof endpoints."

@@ -24,10 +24,12 @@ func main() {
 		limit      = flag.Int("limit", 0, "Limit number of crates to process (0 = no limit)")
 		outDir     = flag.String("out", "out", "Directory to store downloaded files")
 		conc       = flag.Int("concurrency", defaultConcurrency, "Number of concurrent downloads")
+		verifyEx   = flag.Bool("verify-existing", false, "Re-hash and verify existing crate files instead of trusting them during update runs")
 		timeoutSec = flag.Int("timeout", 300, "Per-request timeout in seconds")
 		checksPath = flag.String("checksums", "", "Optional JSONL of {url, sha256}")
-		manifest   = flag.String("manifest", "manifest.jsonl", "Where to write records (JSONL)")
+		manifest   = flag.String("manifest", "manifest.jsonl", "Where to write the JSONL audit log for this run")
 		bundle     = flag.Bool("bundle", false, "Enable rolling tar.zst bundling while downloading")
+		bundleMode = flag.String("bundle-mode", downloader.BundleModeOnly, "How bundled downloads are stored when -bundle is enabled: only|add")
 		bundleGB   = flag.Int64("bundle-size-gb", 8, "Target bundle size in GB")
 		bundlesOut = flag.String("bundles-out", "bundles", "Directory for .tar.zst bundles")
 		logFormat  = flag.String("log-format", "text", "Logging format: text|json")
@@ -43,7 +45,7 @@ func main() {
 		maxIdlePH  = flag.Int("max-idle-per-host", 0, "Override http.Transport MaxIdleConnsPerHost (0=auto)")
 		idleTO     = flag.Duration("idle-timeout", 0, "Override http.Transport IdleConnTimeout (0=auto)")
 		tlsTO      = flag.Duration("tls-timeout", 0, "Override http.Transport TLSHandshakeTimeout (0=auto)")
-		listenAddr = flag.String("listen", "", "Serve Prometheus metrics and pprof at this address (e.g., :9090)")
+		listenAddr = flag.String("listen", ":9090", "Serve Prometheus metrics and pprof at this address (default: :9090; use empty string to disable)")
 	)
 	flag.Parse()
 
@@ -53,6 +55,10 @@ func main() {
 	}
 	if *timeoutSec <= 0 {
 		*timeoutSec = 300
+	}
+	if *bundleMode != downloader.BundleModeOnly && *bundleMode != downloader.BundleModeAdd {
+		slog.Error("invalid bundle-mode", "mode", *bundleMode, "allowed", downloader.BundleModeOnly+"|"+downloader.BundleModeAdd)
+		os.Exit(2)
 	}
 
 	lvl := slog.LevelInfo
@@ -137,7 +143,7 @@ func main() {
 	}
 	defer recFile.Close()
 
-	dl := downloader.NewDownloader(*outDir, *conc, time.Duration(*timeoutSec)*time.Second, sums, recFile, bndl)
+	dl := downloader.NewDownloader(*outDir, *conc, time.Duration(*timeoutSec)*time.Second, sums, recFile, bndl, *verifyEx, *bundleMode)
 	if *progEvery > 0 {
 		dl.ProgressEach(int64(*progEvery))
 	}
@@ -176,6 +182,21 @@ func main() {
 		downloader.StartMetricsServer(*listenAddr)
 	}
 
+	slog.Info(
+		"effective run configuration",
+		"source", sourceSummary(*indexDir, *listPath),
+		"urls", len(urls),
+		"out", *outDir,
+		"manifest", *manifest,
+		"concurrency", *conc,
+		"verify_existing", *verifyEx,
+		"include_yanked", *includeY,
+		"bundle_enabled", *bundle,
+		"bundle_mode", *bundleMode,
+		"bundles_out", bundlesOutSummary(*bundle, *bundlesOut),
+		"metrics_listen", listenSummary(*listenAddr),
+	)
+
 	if *dryRun {
 		// Basic validation and estimation
 		if *indexDir == "" && *listPath == "" {
@@ -192,7 +213,7 @@ func main() {
 			fmt.Println("dry-run: create out dir:", err)
 			os.Exit(1)
 		}
-		fmt.Printf("dry-run ok: urls=%d concurrency=%d out=%s\n", len(urls), *conc, *outDir)
+		fmt.Printf("dry-run ok: urls=%d concurrency=%d out=%s verify-existing=%t bundle-mode=%s\n", len(urls), *conc, *outDir, *verifyEx, *bundleMode)
 		return
 	}
 
@@ -201,4 +222,40 @@ func main() {
 		fmt.Println("error:", err)
 		os.Exit(1)
 	}
+	summary := dl.Snapshot()
+	slog.Info(
+		"run summary",
+		"processed", summary.Processed,
+		"ok", summary.OK,
+		"errors", summary.Errors,
+		"downloaded", summary.Downloaded,
+		"existing", summary.Existing,
+		"verified_existing", summary.VerifiedExisting,
+		"elapsed", summary.Elapsed.String(),
+		"rate_per_sec", fmt.Sprintf("%.1f", summary.RatePerSec),
+		"out", *outDir,
+		"manifest", *manifest,
+		"bundles_out", bundlesOutSummary(*bundle, *bundlesOut),
+	)
+}
+
+func sourceSummary(indexDir, listPath string) string {
+	if indexDir != "" {
+		return "index:" + indexDir
+	}
+	return "list:" + listPath
+}
+
+func bundlesOutSummary(enabled bool, path string) string {
+	if !enabled {
+		return "(disabled)"
+	}
+	return path
+}
+
+func listenSummary(addr string) string {
+	if strings.TrimSpace(addr) == "" {
+		return "(disabled)"
+	}
+	return addr
 }

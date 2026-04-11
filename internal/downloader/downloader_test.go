@@ -1,8 +1,13 @@
 package downloader
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -42,11 +47,15 @@ func TestSanitizeName(t *testing.T) {
 	}
 }
 
-func TestHeaderPathFor(t *testing.T) {
-	base := "serde-1.0.0.crate"
-	hp := headerPathFor("https://static.crates.io/crates/serde/serde-1.0.0.crate", base)
-	if !strings.HasPrefix(hp, "static.crates.io") || !strings.HasSuffix(hp, base) {
-		t.Fatalf("headerPathFor unexpected: %q", hp)
+func TestBundleMemberPath(t *testing.T) {
+	out := t.TempDir()
+	path := filepath.Join(out, "s", "er", "serde-1.0.0.crate")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got := bundleMemberPath(out, path)
+	if got != "s/er/serde-1.0.0.crate" {
+		t.Fatalf("bundleMemberPath unexpected: %q", got)
 	}
 }
 
@@ -71,6 +80,179 @@ func TestVerifyFile(t *testing.T) {
 	}
 }
 
+func TestFetchOneTrustsExistingFileByDefault(t *testing.T) {
+	out := t.TempDir()
+	url := "https://static.crates.io/crates/serde/serde-1.0.0.crate"
+	path := filepath.Join(crateDirFor("serde", out), "serde-1.0.0.crate")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("existing"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var manifest bytes.Buffer
+	d := NewDownloader(out, 1, time.Second, map[string]string{url: strings.Repeat("0", 64)}, &manifest, nil, false, BundleModeOnly)
+	rec := d.fetchOne(t.Context(), url, nil)
+	if !rec.OK || rec.Status != "existing" {
+		t.Fatalf("expected existing status, got ok=%v status=%q", rec.OK, rec.Status)
+	}
+	if rec.Path != path {
+		t.Fatalf("expected existing path %q, got %q", path, rec.Path)
+	}
+}
+
+func TestFetchOneVerifiesExistingFileWhenRequested(t *testing.T) {
+	out := t.TempDir()
+	url := "https://static.crates.io/crates/serde/serde-1.0.0.crate"
+	content := []byte("existing")
+	path := filepath.Join(crateDirFor("serde", out), "serde-1.0.0.crate")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(content)
+
+	var manifest bytes.Buffer
+	d := NewDownloader(out, 1, time.Second, map[string]string{url: hex.EncodeToString(sum[:])}, &manifest, nil, true, BundleModeOnly)
+	rec := d.fetchOne(t.Context(), url, nil)
+	if !rec.OK || rec.Status != "verified_existing" {
+		t.Fatalf("expected verified_existing status, got ok=%v status=%q", rec.OK, rec.Status)
+	}
+	if rec.SHA256 != hex.EncodeToString(sum[:]) {
+		t.Fatalf("expected sha256 %q, got %q", hex.EncodeToString(sum[:]), rec.SHA256)
+	}
+}
+
+func TestFetchOneRedownloadsWhenExistingVerificationFails(t *testing.T) {
+	out := t.TempDir()
+	urlPath := "/crates/serde/serde-1.0.0.crate"
+	newContent := []byte("downloaded")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != urlPath {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		_, _ = io.Copy(w, bytes.NewReader(newContent))
+	}))
+	defer server.Close()
+
+	url := server.URL + urlPath
+	path := filepath.Join(crateDirFor("serde", out), "serde-1.0.0.crate")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(newContent)
+
+	var manifest bytes.Buffer
+	d := NewDownloader(out, 1, time.Second, map[string]string{url: hex.EncodeToString(sum[:])}, &manifest, nil, true, BundleModeOnly)
+	d.client = server.Client()
+
+	rec := d.fetchOne(t.Context(), url, nil)
+	if !rec.OK || rec.Status != "downloaded" {
+		t.Fatalf("expected downloaded status, got ok=%v status=%q", rec.OK, rec.Status)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(newContent) {
+		t.Fatalf("expected redownloaded content %q, got %q", string(newContent), string(got))
+	}
+}
+
+func TestFetchOneBundleOnlyRemovesLooseFile(t *testing.T) {
+	out := t.TempDir()
+	bundlesOut := filepath.Join(out, "bundles")
+	urlPath := "/crates/serde/serde-1.0.0.crate"
+	content := []byte("downloaded")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != urlPath {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		_, _ = io.Copy(w, bytes.NewReader(content))
+	}))
+	defer server.Close()
+
+	sum := sha256.Sum256(content)
+	bndl, err := NewBundler(true, bundlesOut, 1)
+	if err != nil {
+		t.Fatalf("NewBundler: %v", err)
+	}
+	defer bndl.Close()
+
+	var manifest bytes.Buffer
+	d := NewDownloader(out, 1, time.Second, map[string]string{server.URL + urlPath: hex.EncodeToString(sum[:])}, &manifest, bndl, false, BundleModeOnly)
+	d.client = server.Client()
+
+	rec := d.fetchOne(t.Context(), server.URL+urlPath, nil)
+	if !rec.OK || rec.Status != "downloaded" {
+		t.Fatalf("expected downloaded status, got ok=%v status=%q", rec.OK, rec.Status)
+	}
+	if rec.Storage != "bundle" {
+		t.Fatalf("expected bundle storage, got %q", rec.Storage)
+	}
+	if rec.Path != "" {
+		t.Fatalf("expected loose path to be removed, got %q", rec.Path)
+	}
+	if rec.BundlePath == "" || rec.BundleMember == "" {
+		t.Fatalf("expected bundle metadata to be recorded: %+v", rec)
+	}
+	loosePath := filepath.Join(crateDirFor("serde", out), "serde-1.0.0.crate")
+	if _, err := os.Stat(loosePath); !os.IsNotExist(err) {
+		t.Fatalf("expected loose crate file to be removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(rec.BundlePath); err != nil {
+		t.Fatalf("expected bundle file to exist: %v", err)
+	}
+}
+
+func TestFetchOneBundleAddKeepsLooseFile(t *testing.T) {
+	out := t.TempDir()
+	bundlesOut := filepath.Join(out, "bundles")
+	urlPath := "/crates/serde/serde-1.0.0.crate"
+	content := []byte("downloaded")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != urlPath {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		_, _ = io.Copy(w, bytes.NewReader(content))
+	}))
+	defer server.Close()
+
+	sum := sha256.Sum256(content)
+	bndl, err := NewBundler(true, bundlesOut, 1)
+	if err != nil {
+		t.Fatalf("NewBundler: %v", err)
+	}
+	defer bndl.Close()
+
+	var manifest bytes.Buffer
+	d := NewDownloader(out, 1, time.Second, map[string]string{server.URL + urlPath: hex.EncodeToString(sum[:])}, &manifest, bndl, false, BundleModeAdd)
+	d.client = server.Client()
+
+	rec := d.fetchOne(t.Context(), server.URL+urlPath, nil)
+	if !rec.OK || rec.Status != "downloaded" {
+		t.Fatalf("expected downloaded status, got ok=%v status=%q", rec.OK, rec.Status)
+	}
+	if rec.Storage != "filesystem+bundle" {
+		t.Fatalf("expected filesystem+bundle storage, got %q", rec.Storage)
+	}
+	if rec.Path == "" {
+		t.Fatalf("expected loose path to be retained")
+	}
+	if _, err := os.Stat(rec.Path); err != nil {
+		t.Fatalf("expected loose crate file to exist: %v", err)
+	}
+	if _, err := os.Stat(rec.BundlePath); err != nil {
+		t.Fatalf("expected bundle file to exist: %v", err)
+	}
+}
+
 func TestBundlerRotation(t *testing.T) {
 	// Create two small files
 	tmp := t.TempDir()
@@ -91,10 +273,10 @@ func TestBundlerRotation(t *testing.T) {
 	}
 	defer bndl.Close()
 
-	if err := bndl.AddFile(a, "a.txt"); err != nil {
+	if _, err := bndl.AddFile(a, "a.txt", Record{URL: "https://example.com/a.txt"}, "a"); err != nil {
 		t.Fatalf("AddFile a: %v", err)
 	}
-	if err := bndl.AddFile(b, "b.txt"); err != nil {
+	if _, err := bndl.AddFile(b, "b.txt", Record{URL: "https://example.com/b.txt"}, "b"); err != nil {
 		t.Fatalf("AddFile b: %v", err)
 	}
 	_ = bndl.Close()
@@ -108,6 +290,22 @@ func TestBundlerRotation(t *testing.T) {
 	}
 	if len(entries) < 2 {
 		t.Fatalf("expected >=2 bundle files, got %d", len(entries))
+	}
+	catalogPath := filepath.Join(bundlesOut, "bundles.index.jsonl")
+	data, err := os.ReadFile(catalogPath)
+	if err != nil {
+		t.Fatalf("expected bundle catalog: %v", err)
+	}
+	lines := bytes.Split(bytes.TrimSpace(data), []byte("\n"))
+	if len(lines) < 2 {
+		t.Fatalf("expected >=2 catalog entries, got %d", len(lines))
+	}
+	var first map[string]any
+	if err := json.Unmarshal(lines[0], &first); err != nil {
+		t.Fatalf("unmarshal catalog entry: %v", err)
+	}
+	if first["bundle_path"] == "" || first["manifest_path"] == "" {
+		t.Fatalf("catalog entry missing paths: %+v", first)
 	}
 	runtime.KeepAlive(bndl)
 }

@@ -10,10 +10,16 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
+)
+
+const defaultConcurrency = 128
+
+const (
+	OutputModeFiles = "files"
+	OutputModeJSONL = "jsonl"
 )
 
 type Config struct {
@@ -25,6 +31,9 @@ type Config struct {
 	BaseURL          string
 	ProgressInterval time.Duration
 	ProgressEvery    int
+	OutputMode       string
+	JSONLOut         string
+	ManifestPath     string
 }
 
 type Stats struct {
@@ -93,22 +102,73 @@ func (lc *LimitCounter) Remaining() int64 {
 	return lc.remaining
 }
 
+type ManifestHint struct {
+	Storage      string `json:"storage"`
+	BundlePath   string `json:"bundle_path"`
+	BundleMember string `json:"bundle_member"`
+}
+
+type JSONLWriter struct {
+	mu sync.Mutex
+	f  *os.File
+}
+
+func NewJSONLWriter(path string) (*JSONLWriter, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	return &JSONLWriter{f: f}, nil
+}
+
+func (w *JSONLWriter) WriteRecord(record map[string]any) error {
+	b, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, err := w.f.Write(b); err != nil {
+		return err
+	}
+	_, err = w.f.Write([]byte("\n"))
+	return err
+}
+
+func (w *JSONLWriter) Close() error {
+	if w == nil || w.f == nil {
+		return nil
+	}
+	return w.f.Close()
+}
+
 var ErrLimitReached = errors.New("sidecar limit reached")
 
 func DefaultConcurrency() int {
-	return sidecarMax(64, runtime.NumCPU()*16)
+	return defaultConcurrency
 }
 
-// Generate walks the crates.io index and writes sidecar metadata files alongside the mirror layout.
 func Generate(ctx context.Context, cfg Config) (Stats, error) {
 	if cfg.IndexDir == "" {
 		return Stats{}, errors.New("index dir is required")
 	}
-	if cfg.OutDir == "" {
-		return Stats{}, errors.New("out dir is required")
-	}
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = "https://static.crates.io/crates"
+	}
+	if cfg.OutputMode == "" {
+		cfg.OutputMode = OutputModeFiles
+	}
+	if cfg.OutputMode != OutputModeFiles && cfg.OutputMode != OutputModeJSONL {
+		return Stats{}, fmt.Errorf("invalid output mode %q", cfg.OutputMode)
+	}
+	if cfg.OutputMode == OutputModeFiles && cfg.OutDir == "" {
+		return Stats{}, errors.New("out dir is required for files mode")
+	}
+	if cfg.OutputMode == OutputModeJSONL && cfg.JSONLOut == "" {
+		return Stats{}, errors.New("jsonl output path is required for jsonl mode")
 	}
 
 	concurrency := cfg.Concurrency
@@ -148,8 +208,24 @@ func Generate(ctx context.Context, cfg Config) (Stats, error) {
 		return Stats{}, fmt.Errorf("no index files found under %s", cfg.IndexDir)
 	}
 
-	if err := os.MkdirAll(cfg.OutDir, 0o755); err != nil {
+	if cfg.OutputMode == OutputModeFiles {
+		if err := os.MkdirAll(cfg.OutDir, 0o755); err != nil {
+			return Stats{}, err
+		}
+	}
+
+	manifestHints, err := ReadManifestHints(cfg.ManifestPath)
+	if err != nil {
 		return Stats{}, err
+	}
+
+	var jsonlWriter *JSONLWriter
+	if cfg.OutputMode == OutputModeJSONL {
+		jsonlWriter, err = NewJSONLWriter(cfg.JSONLOut)
+		if err != nil {
+			return Stats{}, err
+		}
+		defer jsonlWriter.Close()
 	}
 
 	jobs := make(chan string, sidecarMax(1024, concurrency*2))
@@ -175,7 +251,7 @@ func Generate(ctx context.Context, cfg Config) (Stats, error) {
 				if limitBudget != nil && limitBudget.Remaining() <= 0 {
 					continue
 				}
-				if err := ProcessIndexFile(cfg.IndexDir, path, cfg.OutDir, cfg.IncludeYanked, limitBudget, cfg.BaseURL, ctrs); err != nil {
+				if err := ProcessIndexFile(cfg, path, limitBudget, manifestHints, ctrs, jsonlWriter); err != nil {
 					if errors.Is(err, ErrLimitReached) {
 						return
 					}
@@ -226,7 +302,11 @@ func Generate(ctx context.Context, cfg Config) (Stats, error) {
 		}()
 	}
 
-	slog.Info("sidecar_start", "files", len(files), "concurrency", concurrency, "out", cfg.OutDir)
+	startOut := cfg.OutDir
+	if cfg.OutputMode == OutputModeJSONL {
+		startOut = cfg.JSONLOut
+	}
+	slog.Info("sidecar_start", "files", len(files), "concurrency", concurrency, "mode", cfg.OutputMode, "out", startOut)
 
 loop:
 	for _, f := range files {
@@ -256,8 +336,7 @@ loop:
 	return stats, nil
 }
 
-// ProcessIndexFile reads one index file and writes sidecar JSON documents for each version entry.
-func ProcessIndexFile(indexRoot, indexPath, outDir string, includeYanked bool, limit *LimitCounter, baseURL string, ctrs *counters) error {
+func ProcessIndexFile(cfg Config, indexPath string, limit *LimitCounter, manifestHints map[string]ManifestHint, ctrs *counters, jsonlWriter *JSONLWriter) error {
 	f, err := os.Open(indexPath)
 	if err != nil {
 		return err
@@ -265,7 +344,7 @@ func ProcessIndexFile(indexRoot, indexPath, outDir string, includeYanked bool, l
 	defer f.Close()
 
 	relIndex := indexPath
-	if rel, err := filepath.Rel(indexRoot, indexPath); err == nil {
+	if rel, err := filepath.Rel(cfg.IndexDir, indexPath); err == nil {
 		relIndex = filepath.ToSlash(rel)
 	}
 
@@ -284,22 +363,14 @@ func ProcessIndexFile(indexRoot, indexPath, outDir string, includeYanked bool, l
 			return ErrLimitReached
 		}
 
-		var m map[string]any
-		if err := json.Unmarshal([]byte(line), &m); err != nil {
-			ctrs.incErrors()
-			continue
-		}
-		name, _ := m["name"].(string)
-		vers, _ := m["vers"].(string)
-		if name == "" || vers == "" {
-			ctrs.incSkipped()
-			continue
-		}
-		if !includeYanked {
-			if y, ok := m["yanked"].(bool); ok && y {
+		record, name, vers, err := buildSidecarRecord(line, relIndex, cfg.BaseURL, cfg.IncludeYanked, manifestHints)
+		if err != nil {
+			if errors.Is(err, errSkipRecord) {
 				ctrs.incSkipped()
 				continue
 			}
+			ctrs.incErrors()
+			continue
 		}
 
 		limitReserved := false
@@ -310,65 +381,151 @@ func ProcessIndexFile(indexRoot, indexPath, outDir string, includeYanked bool, l
 			limitReserved = true
 		}
 
-		dir := CrateDirFor(name, outDir)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			if limitReserved {
-				limit.Release()
+		switch cfg.OutputMode {
+		case OutputModeFiles:
+			if err := writeSidecarFile(cfg.OutDir, name, vers, record); err != nil {
+				if limitReserved {
+					limit.Release()
+				}
+				if errors.Is(err, errSkipRecord) {
+					ctrs.incSkipped()
+					continue
+				}
+				ctrs.incErrors()
+				continue
 			}
-			ctrs.incErrors()
-			continue
+		case OutputModeJSONL:
+			if err := jsonlWriter.WriteRecord(record); err != nil {
+				if limitReserved {
+					limit.Release()
+				}
+				ctrs.incErrors()
+				continue
+			}
 		}
-		sidecarName := fmt.Sprintf("%s-%s.crate.json", name, vers)
-		outPath := filepath.Join(dir, sidecarName)
 
-		if _, err := os.Stat(outPath); err == nil {
-			if limitReserved {
-				limit.Release()
-			}
-			ctrs.incSkipped()
-			continue
-		}
-
-		m["crate_file"] = fmt.Sprintf("%s-%s.crate", name, vers)
-		m["crate_url"] = fmt.Sprintf("%s/%s/%s-%s.crate", strings.TrimRight(baseURL, "/"), name, name, vers)
-		m["index_path"] = relIndex
-
-		tmpPath := outPath + ".tmp"
-		of, err := os.Create(tmpPath)
-		if err != nil {
-			if limitReserved {
-				limit.Release()
-			}
-			ctrs.incErrors()
-			continue
-		}
-		enc := json.NewEncoder(of)
-		enc.SetEscapeHTML(false)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(m); err != nil {
-			of.Close()
-			_ = os.Remove(tmpPath)
-			if limitReserved {
-				limit.Release()
-			}
-			ctrs.incErrors()
-			continue
-		}
-		of.Close()
-		if err := os.Rename(tmpPath, outPath); err != nil {
-			_ = os.Remove(tmpPath)
-			if limitReserved {
-				limit.Release()
-			}
-			ctrs.incErrors()
-			continue
-		}
 		ctrs.incWrote()
 	}
 	if err := s.Err(); err != nil && !errors.Is(err, io.EOF) {
 		return err
 	}
 	return nil
+}
+
+var errSkipRecord = errors.New("skip record")
+
+func buildSidecarRecord(line, relIndex, baseURL string, includeYanked bool, manifestHints map[string]ManifestHint) (map[string]any, string, string, error) {
+	var m map[string]any
+	if err := json.Unmarshal([]byte(line), &m); err != nil {
+		return nil, "", "", err
+	}
+	name, _ := m["name"].(string)
+	vers, _ := m["vers"].(string)
+	if name == "" || vers == "" {
+		return nil, "", "", errSkipRecord
+	}
+	if !includeYanked {
+		if y, ok := m["yanked"].(bool); ok && y {
+			return nil, "", "", errSkipRecord
+		}
+	}
+
+	crateFile := fmt.Sprintf("%s-%s.crate", name, vers)
+	crateURL := fmt.Sprintf("%s/%s/%s", strings.TrimRight(baseURL, "/"), name, crateFile)
+	m["crate_file"] = crateFile
+	m["crate_url"] = crateURL
+	m["index_path"] = relIndex
+
+	if hint, ok := manifestHints[crateURL]; ok {
+		if hint.Storage != "" {
+			m["storage"] = hint.Storage
+		}
+		if hint.BundlePath != "" {
+			m["bundle_path"] = hint.BundlePath
+		}
+		if hint.BundleMember != "" {
+			m["bundle_member"] = hint.BundleMember
+		}
+	}
+
+	return m, name, vers, nil
+}
+
+func writeSidecarFile(outDir, name, vers string, record map[string]any) error {
+	dir := CrateDirFor(name, outDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	sidecarName := fmt.Sprintf("%s-%s.crate.json", name, vers)
+	outPath := filepath.Join(dir, sidecarName)
+
+	if _, err := os.Stat(outPath); err == nil {
+		return errSkipRecord
+	}
+
+	tmpPath := outPath + ".tmp"
+	of, err := os.Create(tmpPath)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(of)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(record); err != nil {
+		of.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := of.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, outPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
+func ReadManifestHints(path string) (map[string]ManifestHint, error) {
+	if path == "" {
+		return map[string]ManifestHint{}, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	type manifestRecord struct {
+		URL          string `json:"url"`
+		Storage      string `json:"storage"`
+		BundlePath   string `json:"bundle_path"`
+		BundleMember string `json:"bundle_member"`
+	}
+
+	out := make(map[string]ManifestHint)
+	s := bufio.NewScanner(f)
+	s.Buffer(make([]byte, 0, 1024*1024), 64*1024*1024)
+	for s.Scan() {
+		line := strings.TrimSpace(s.Text())
+		if line == "" {
+			continue
+		}
+		var rec manifestRecord
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue
+		}
+		if rec.URL == "" {
+			continue
+		}
+		out[rec.URL] = ManifestHint{
+			Storage:      rec.Storage,
+			BundlePath:   rec.BundlePath,
+			BundleMember: rec.BundleMember,
+		}
+	}
+	return out, s.Err()
 }
 
 // CrateDirFor mirrors the shard layout used for crate artifacts.

@@ -8,8 +8,8 @@ Legend: [ ] not started | [x] done | [~] in progress
 ---
 
 ## Structural Refactor
-- [ ] Move CLI entry points into `cmd/` directories and extract shared logic into reusable packages.
-- [ ] Update tests to exercise new packages and ensure `go test ./...` passes.
+- [x] Move CLI entry points into `cmd/` directories and extract shared logic into reusable packages.
+- [x] Update tests to exercise new packages and ensure `go test ./...` passes.
 - [ ] Add integration test harness using synthetic index fixtures.
 
 ## CI and Tooling
@@ -19,8 +19,8 @@ Legend: [ ] not started | [x] done | [~] in progress
 
 ## Documentation
 - [x] Rewrite README with ASCII-only content and current instructions.
-- [ ] Expand `Docs/architecture.md` with diagrams and manifest schema appendix.
-- [ ] Add HOWTO guides (quick mirror, delta sync, air-gapped restore).
+- [x] Expand `Docs/Architecture.md` with current pipeline behavior, bundle semantics, and manifest notes.
+- [x] Add HOWTO guidance for loose mirrors, fast update runs, bundle workflows, JSONL sidecars, and extraction.
 - [ ] Create CONTRIBUTING.md, CODEOWNERS, and issue/PR templates.
 - [ ] Document GUI roadmap in `Docs/gui-roadmap.md`.
 
@@ -38,10 +38,14 @@ Legend: [ ] not started | [x] done | [~] in progress
 - [x] Ensure Clone-Index defaults are portable and non-interruptive.
 - [x] Harden downloader retries and metrics behaviour.
 - [x] Make sidecar limits concurrency-safe.
+- [x] Standardize downloader and sidecar defaults to `128`.
+- [x] Implement fast incremental update mode with opt-in `-verify-existing`.
+- [x] Add bundle modes (`only|add`), per-bundle manifests, and bundle extraction tooling.
+- [x] Add JSONL sidecar mode for bundled workflows.
 
 ---
 
 Notes
-- Run targeted tests for each tool until repo restructuring enables `go test ./...`.
+- `go test ./...` now passes; keep extending coverage around bundle workflows and extraction.
 - Keep documentation ASCII-only to avoid rendering artefacts in terminals and GitHub UI.
 - When refactoring packages, update the Python wrapper to call the relocated binaries or shared library.
